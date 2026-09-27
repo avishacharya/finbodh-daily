@@ -1,0 +1,35 @@
+# finbodh-daily: build the day's price layer and publish it as plain files.
+# No secret is used anywhere. The source data is the exchange's public figures,
+# and the Worker reads the output back from this public branch. A failed
+# refresh exits non-zero before anything is pushed.
+name: daily
+
+on:
+  schedule:
+    - cron: '30 13 * * 0-4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install openpyxl
+      - run: python3 scripts/refresh.py --overlay ov.json
+      - run: python3 scripts/refresh.py --publish daily ov.json.chunks.json
+      - name: push daily/ as the only commit of branch data
+        run: |
+          git config user.name "finbodh-daily"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan data-tmp
+          git rm -rq --cached .
+          git add daily
+          git commit -m "daily $(date -u +%Y-%m-%d)"
+          git push -f origin HEAD:data
