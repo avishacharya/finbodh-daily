@@ -10,6 +10,11 @@ session with only the published artifact to work from.
     python3 refresh.py --overlay ov.json [news.json]  build the daily layer alone
     python3 refresh.py --upload https://base [ov.json]  push the chunks to the site
     python3 refresh.py --publish DIR [side.json]    write the chunks as plain files
+    python3 refresh.py --dry-run --out DIR [--fixtures]
+            what the nightly run would publish, written to DIR instead: the
+            would-be overlay plus a diff summary (summary.json). --fixtures
+            reads the exchange from tests/fixtures/dse_com_bd instead of the
+            network and touches nothing but DIR.
 
 The overlay is the same work, emitted as a standalone document instead of a
 rewritten 5 MB bundle. It is stored in the site's own database and fetched by
@@ -34,13 +39,57 @@ and any indicator that needs more sessions than a ticker has stays absent.
 """
 import json, sys, os, math, re, time, urllib.request, urllib.parse, datetime, tempfile
 
+# 3A03's parsers read the new site's responses. The fallback fills the
+# mirror's missing sessions from what they return, so the refresh needs them
+# beside it; a fresh checkout without src/build (the old unattended paths ran
+# from the artifact alone) falls back to no archive work at all.
+try:
+    _SB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "src", "build")
+    if _SB not in sys.path: sys.path.insert(0, _SB)
+    import dse_new
+except ImportError:
+    dse_new = None
+
 RAW = "https://raw.githubusercontent.com/"
 DSE_JSON = RAW + "niaz86/DSE/master/dse_companies.json"
 DSE_XLSX = RAW + "niaz86/DSE/master/dse_stocks.xlsx"
 IDX_XLSX = RAW + "niaz86/DSE/master/dse_market_summary.xlsx"
 MOV_URL = RAW + "Suhried/dse_share/main/docs/output.json"
 UA = "Finbodh/0.2 (+https://finbodh.com)"
-DSE_BASE = "https://www.dsebd.org/"
+# The exchange's own site. The old dsebd.org serves the same rows as a JSON
+# document under /api/live, and that is the fallback when the mirror sits
+# behind the exchange (read_archive below); dsebd.org itself 410s, so the
+# exchange's base is the live one.
+DSE_BASE = "https://www.dse.com.bd/"
+FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tests", "fixtures", "dse_com_bd")
+_FIX = False            # --fixtures: the exchange's answers come from the
+                        # captured 3A02 fixtures, and the 1s wait is skipped
+_NOW = None             # the Dhaka clock, overridable by the tests and
+                        # --dry-run --today (None = the real clock)
+
+
+def _fix(url):
+    """--fixtures: the captured file for a live URL, by its _fetchlog
+    recording; None when nothing was captured for it (the call then fails
+    exactly as a network failure would)."""
+    if not _FIX: return None
+    q = urllib.parse.urlparse(url)
+    path = q.path.lstrip("/")
+    with open(os.path.join(FIXTURES, "_fetchlog.txt"), encoding="utf-8") as f:
+        for line in f:
+            p = line.split("|")
+            if len(p) < 6: continue
+            u = p[2].strip()
+            pu = urllib.parse.urlparse(u if "://" in u else "https://www.dse.com.bd/" + u)
+            if pu.path != "/" + path: continue
+            dest = p[5].strip()
+            if dest.startswith("tests/fixtures/"):
+                full = os.path.join(os.path.dirname(FIXTURES), dest[len("tests/fixtures/"):])
+                if os.path.exists(full): return full
+    return None
+
 PREFIX = "window.__FB__ = "
 GAP_PCT = 12.0
 MIN_FOR = {"ma20": 20, "ma50": 50, "ma100": 100, "rsi14": 15, "macd": 35,
@@ -177,7 +226,20 @@ ARCHIVE_BUDGET_SEC = 12 * 60
 ARCHIVE_MAX_REQ = 450
 
 
+def _fix_text(url):
+    """--fixtures: the raw captured text for a live URL (HTML pages included),
+    or None when nothing was captured for it (the call then fails exactly as
+    a network failure would)."""
+    cap = _fix(url)
+    if cap is None: return None
+    with open(cap, encoding="utf-8") as f:
+        return f.read()
+
+
 def _http_json(url, timeout=60, referer=None):
+    t = _fix_text(url)
+    if t is not None:
+        return json.loads(t)
     headers = {"User-Agent": UA, "Accept": "*/*"}
     if referer: headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
@@ -185,24 +247,59 @@ def _http_json(url, timeout=60, referer=None):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+def dhaka_now():
+    """Asia/Dhaka (UTC+6, no DST) now, as a datetime."""
+    if _NOW is not None:
+        return _NOW
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("Asia/Dhaka"))
+    except Exception:
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=6)
+
+
+def is_trading_day(d):
+    """The DSE trades Sunday to Thursday (weekday() Monday=0 .. Sunday=6)."""
+    return d.weekday() in (0, 1, 2, 3, 6)
+
+
+def last_trading_day(today, now=None):
+    """The newest session that may already exist. A trading day's session is
+    not public until after 15:00 Dhaka, so the day itself only counts once
+    its clock is past that; before it, the last trading day is earlier in the
+    week (or the previous one). `today` is a date (or an iso date/datetime,
+    which is normalized here), `now` a Dhaka datetime (defaults to the real
+    one) so the tests can pin the clock."""
+    now = now or dhaka_now()
+    if isinstance(today, str):
+        today = datetime.date.fromisoformat(today[:10])
+    elif isinstance(today, datetime.datetime):
+        today = today.date()
+    d = today
+    while d > now.date():
+        d -= datetime.timedelta(days=1)
+    if d == now.date() and (now.hour, now.minute) < (15, 0):
+        d -= datetime.timedelta(days=1)
+    while not is_trading_day(d):
+        d -= datetime.timedelta(days=1)
+    return d
+
+
 def read_board():
     """The live board: every listed security for its latest session, uncapped.
-    Returns ({code: (date, open, high, low, close, volume)}, session_date)."""
+    Returns ({code: (date, open, high, low, close, volume, prev_close)},
+    session_date), parsed by 3A03's parse_latest; prev_close is the
+    exchange's own ycp, None when it carries no previous close."""
     doc = _http_json(DSE_BASE + "api/live/prices", timeout=60)
-    cols = doc.get("cols") or []
-    rows = doc.get("rows") or []
-    if not cols or not rows or not all(k in cols for k in ("code", "close")):
-        raise ValueError("board response has no usable columns")
     date = str(((doc.get("session") or {}).get("sessionDate") or "")).strip()
     out = {}
-    for r in rows:
-        d = dict(zip(cols, r))
-        code = str(d.get("code") or "").strip().upper()
-        if not re.match(r"^[A-Z0-9.()\-]{2,20}$", code): continue
-        close = n_(d.get("close"))
-        if not close or close <= 0: continue
-        out[code] = (date, n_(d.get("open")), n_(d.get("high")), n_(d.get("low")),
-                     close, n_(d.get("volume")))
+    for r in dse_new.parse_latest(json.dumps(doc)):
+        code, c = r.get("code"), r.get("close")
+        if not code or not c or c <= 0: continue
+        out[code] = (date, r.get("open"), r.get("high"), r.get("low"),
+                     c, r.get("volume"), r.get("ycp"))
+    if not out:
+        raise ValueError("the board gave no usable rows")
     return out, date
 
 
@@ -218,8 +315,17 @@ def _day_end_request(log, date, inst=None):
     except Exception as e:
         log.append("day-end %s FAILED, left as-is: %s" % (inst or date, e))
         return None, None
-    rows = dayEndParse(json.dumps(doc))
     total = doc.get("total") if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or not isinstance(doc.get("rows"), list):
+        return {}, total
+    rows = {}
+    for r in dse_new.parse_archive(json.dumps(doc)):
+        code, c = r.get("code"), r.get("close")
+        if not code or not c or c <= 0: continue
+        d = r.get("date") or date
+        rows.setdefault(code, []).append(
+            (d, r.get("open"), r.get("high"), r.get("low"), c, r.get("volume"),
+             r.get("ycp")))
     return rows, total
 
 
@@ -238,24 +344,162 @@ def _market_summary(log, f, t):
                    % (f, t, e))
         return None
     out = []
-    for r in (doc.get("rows") or []):
-        d = str(r.get("date") or "").strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d): continue
-        out.append((d, n_(r.get("dsex")), n_(r.get("ds30"))))
+    for r in dse_new.parse_index(json.dumps(doc)):
+        d = r.get("date")
+        if not d: continue
+        out.append((d, r.get("dsex"), r.get("ds30")))
     return out
 
 
-def read_archive(log, since, tickers=None):
+def _read_text(url):
+    """--fixtures: the captured page text, else the network fetch as text."""
+    t = _fix_text(url)
+    if t is not None: return t
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _limits(log):
+    """The day's circuit-breaker bands, {code: (lower, upper)} from the
+    exchange's markets page (3A03's parse_markets); {} when the page is
+    unreachable — a filled price is then checked against a 12% move instead."""
+    try:
+        text = _read_text(DSE_BASE + "markets")
+    except Exception as e:
+        log.append("markets page FAILED, limit bands unavailable: %s" % e)
+        return {}
+    out = {}
+    for r in dse_new.parse_markets(text).get("limits") or []:
+        lo, up = r.get("lower"), r.get("upper")
+        if r.get("code") and lo is not None and up is not None:
+            out[r["code"]] = (lo, up)
+    return out
+
+
+def _outside_limit(code, ycp, close, limits):
+    """A filled session whose close sits outside its day's band. The band is
+    the exchange's own upper/lower limit for the security when the markets
+    page carried one; otherwise a move beyond +/-12% — past the
+    circuit-breaker, so a corporate action rather than trading."""
+    if not code or close is None:
+        return None
+    band = limits.get(code)
+    if band:
+        if not (band[0] <= close <= band[1]):
+            return {"code": code, "close": close,
+                    "band": [band[0], band[1]], "kind": "band"}
+        return None
+    if ycp:
+        pct = 100.0 * (close / ycp - 1.0)
+        if abs(pct) > GAP_PCT:
+            return {"code": code, "close": close, "prev": ycp,
+                    "pct": round(pct, 2), "kind": "12pct"}
+    return None
+
+
+def decode_px(px, cal):
+    """The inverse of encode_px: a shipped px block back to session rows
+    {d, o, h, l, c, v}. `c` is cumulative paisa deltas (the running total over
+    100 is the close); `o`/`h`/`l` are paisa deltas from that session's close
+    (0 is a real delta, the price at its close); a position listed in `x` has
+    no open, high or low (its volume is still real); `v` is thousands of
+    shares (0 is a miss); `k` is an explicit calendar index per row when the
+    calendar has holes, else i0 + i."""
+    rows = []
+    if not isinstance(px, dict):
+        return rows
+    cc = px.get("c") or []
+    if not cc:
+        return rows
+    ks = px.get("k")
+    i0 = px.get("i0") or 0
+    oo, hh, ll = px.get("o"), px.get("h"), px.get("l")
+    xs = set(px.get("x") or [])
+    vv = px.get("v")
+    v = 0
+    for i in range(len(cc)):
+        v += cc[i]
+        close = v / 100.0
+        k = ks[i] if ks else i0 + i
+        d = cal[k] if isinstance(cal, list) and 0 <= k < len(cal) else ""
+        o = h = l = None
+        if oo is not None and hh is not None and ll is not None and i not in xs:
+            o = (oo[i] + v) / 100.0
+            h = (hh[i] + v) / 100.0
+            l = (ll[i] + v) / 100.0
+        vol = (vv[i] * 1000.0) if (vv is not None and vv[i]) else None
+        rows.append({"d": d, "o": o, "h": h, "l": l, "c": close, "v": vol})
+    return rows
+
+
+def encode_px(rr, cal, cali):
+    """Session rows {d, c, o?, h?, l?, v?} into the shipped px block. `c` is
+    cumulative paisa deltas, `v` thousands of shares, `k` an explicit calendar
+    index when the rows are not contiguous; the session's open, high and low
+    go in as paisa deltas from its close, and a row whose source carries no
+    open, high or low (or whose candle contradicts its own close) gets 0 in all
+    three and its position in `x` — a candle the source would not support is
+    not drawn, and nothing is invented to fill it. A series with no known open,
+    high or low at all carries none of the four keys."""
+    cc, vv, prev = [], [], 0
+    for r in rr:
+        x = int(round(r["c"] * 100))
+        cc.append(x - prev)
+        prev = x
+        vv.append(int(round((r.get("v") or 0) / 1000.0)))
+    ks = [cali[r["d"]] for r in rr]
+    px = {"i0": ks[0], "c": cc}
+    if ks != list(range(ks[0], ks[0] + len(ks))):
+        px["k"] = ks
+    if any(vv):
+        px["v"] = vv
+    oo, hh, ll, xmiss, any_k = [], [], [], [], False
+    for j, r in enumerate(rr):
+        cp = int(round(r["c"] * 100))
+        try:
+            op = int(round(r["o"] * 100)) if r.get("o") else 0
+            hp = int(round(r["h"] * 100)) if r.get("h") else 0
+            lp = int(round(r["l"] * 100)) if r.get("l") else 0
+            if not (op > 0 and hp > 0 and lp > 0):
+                raise ValueError
+            if not (lp <= min(op, cp) and max(op, cp) <= hp):
+                raise ValueError
+        except (TypeError, ValueError):
+            xmiss.append(j)
+            oo.append(0); hh.append(0); ll.append(0)
+            continue
+        any_k = True
+        oo.append(op - cp); hh.append(hp - cp); ll.append(lp - cp)
+    if any_k:
+        px["o"] = oo; px["h"] = hh; px["l"] = ll
+        if xmiss:
+            px["x"] = xmiss
+    return px
+
+
+def read_archive(log, since, tickers=None, today=None):
     """Every listed security for every session after `since` (the mirror's
-    newest). The board covers the newest session in one uncapped request; each
-    other session the mirror still lacks is a whole-market day-end request,
-    one per second, and the few listed securities its 500-row cap dropped get
-    per-instrument requests (still one per second, under 450 a night, a 12-
-    minute stop). `tickers` is the mirror's set of listed codes, used to find
-    the capped ones. The market-summary is the session calendar and carries
-    the index closes the mirror's index file may lack. Returns
-    ({code: {date: row-tuple}}, newest, [(date, dsex, ds30)]) or
-    (None, None, None) to leave the mirror exactly as it was."""
+    newest), from the new site, parsed by 3A03's parsers. The fallback runs
+    only when the mirror is stale — `since` older than the last DSE trading
+    day (Sunday to Thursday, a day's session counted only after 15:00 Dhaka;
+    `today` and the Dhaka clock are overridable for the tests) — and then
+    fills only the sessions the mirror lacks. The board covers the newest
+    session in one uncapped request; each other missing session is a
+    whole-market day-end request, one per second, and the few listed
+    securities its 500-row cap dropped get per-instrument requests (still one
+    per second, under 450 a night, a 12-minute stop). `tickers` is the
+    mirror's set of listed codes, used to find the capped ones. The
+    market-summary is the session calendar and carries the index closes the
+    mirror's index file may lack. Returns ({code: {date: row-tuple}}, newest,
+    [(date, dsex, ds30)]) or (None, None, None) to leave the mirror exactly
+    as it was."""
+    today = today or dhaka_now().date()
+    lsd = last_trading_day(today).isoformat()
+    if since and since >= lsd:
+        log.append("mirror is fresh (newest %s, last trading day %s); "
+                   "no archive fill" % (since, lsd))
+        return None, None, None
     t0 = time.time()
     out, nreq, newest, summary = {}, 0, None, []
     tickers = set(tickers or ())
@@ -265,13 +509,22 @@ def read_archive(log, since, tickers=None):
             raise TimeoutError("the 12-minute budget is reached")
         if nreq >= ARCHIVE_MAX_REQ:
             raise TimeoutError("the 450-request budget is reached")
-        if nreq: time.sleep(1)          # one request per second, never more
+        if nreq and not _FIX:
+            time.sleep(1)          # one request per second, never more
+
+    refused = 0
 
     def fill(rows):
-        nonlocal newest
+        nonlocal newest, refused
         if not rows: return
         for code, sess in rows.items():
             for s in sess:
+                # Guard: a session dated after the last trading day is not
+                # closed yet (a live board, or a stale row that leaked in) —
+                # it is never stored.
+                if s[0] > lsd:
+                    refused += 1
+                    continue
                 if s[0] > since:
                     out.setdefault(code, {})[s[0]] = s
                     newest = s[0] if newest is None else max(newest, s[0])
@@ -282,17 +535,23 @@ def read_archive(log, since, tickers=None):
         nreq += 1
         if not bdate or not board:
             raise ValueError("the board gave no session or rows")
-        # The board is live during trading hours (10:00-14:30 Dhaka). Its
-        # session only counts once the day has closed; a run before 15:00 on
-        # the board's own date would store a half-day as a session.
-        dhaka_now = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
-        if bdate >= dhaka_now.date().isoformat() and dhaka_now.hour < 15:
-            raise ValueError("the board is today's and the session has not "
-                             "closed; run after 15:00 Dhaka")
-        fill({c: [s] for c, s in board.items()})
-        newest = bdate
+        # The board is live during trading hours (10:00-14:30 Dhaka). A
+        # session only exists once its day has closed after 15:00 Dhaka. A
+        # board date past the last trading day is a half-day, not a session:
+        # its rows are not stored at all, and the newest closed session (the
+        # last trading day) is fetched from the day-end archive and the market
+        # summary like any other missing session.
+        board_live = bdate > lsd
+        if board_live:
+            log.append("board session %s is live; not stored" % bdate)
+            bdate = lsd
+        else:
+            fill({c: [s] for c, s in board.items()})
+            newest = bdate
         # The sessions the mirror still lacks, per the exchange's own
-        # calendar: everything between `since` and the board's session.
+        # calendar: everything between `since` and the newest closed session.
+        # When the board is live, that newest session is not in the board, so
+        # it is part of the backfill (fetched from the day-end archive).
         d_board = datetime.date.fromisoformat(bdate)
         d_since = datetime.date.fromisoformat(since)
         wait()
@@ -301,12 +560,13 @@ def read_archive(log, since, tickers=None):
         if window is not None:
             summary = [(d, a, b) for d, a, b in window if d > since]
             gaps = sorted(d for d, _a, _b in window
-                          if since < d < bdate)
+                          if since < d < bdate or (board_live and d == bdate))
         else:
             # Without the exchange's calendar there is no safe guess: the
             # day-end endpoint re-dates a holiday to the last session, so a
             # guessed date can mint a session that never traded. The earlier
-            # sessions stay with the mirror tonight; the board still counts.
+            # sessions stay with the mirror tonight; a closed board still
+            # counts, a live board is stored for nothing.
             log.append("exchange: no session calendar, earlier sessions stay "
                        "with the mirror")
             gaps = []
@@ -344,8 +604,9 @@ def read_archive(log, since, tickers=None):
     if not out:
         log.append("exchange: no rows beyond the mirror; mirror left unchanged")
         return None, None, None
-    log.append("exchange: path b, %d requests, %d seconds, newest %s"
-               % (nreq, int(time.time() - t0), newest))
+    log.append("exchange: the stale mirror's missing sessions are filled to %s "
+               "(%d requests, %d seconds, %d live row(s) refused)"
+               % (newest, nreq, int(time.time() - t0), refused))
     return out, newest, summary
 
 
@@ -366,7 +627,7 @@ def merge_archive(series, arc, tickers=None):
             continue
         base = series.get(code)
         for d, s in sorted(dates.items()):
-            (dd, o, h, l, c, v) = s
+            (dd, o, h, l, c, v, ycp) = s
             newest = d if newest is None else max(newest, d)
             if base is None:
                 series[code] = [{"d": d, "o": o, "h": h, "l": l, "c": c, "v": v}]
@@ -531,7 +792,7 @@ def clean_sessions(series, index_dates=(), min_n=20):
     return out, sorted(copies), moved
 
 
-def read_prices(log):
+def read_prices(log, today=None):
     try:
         import openpyxl                                   # noqa
     except ImportError:
@@ -595,7 +856,8 @@ def read_prices(log):
     try:
         since = max((r["d"] for rows in series.values() for r in rows), default=None)
         if since:
-            arc, arc_newest, arc_idx = read_archive(log, since, tickers=list(series))
+            arc, arc_newest, arc_idx = read_archive(log, since, tickers=list(series),
+                                                    today=today)
             if arc:
                 log.append(merge_archive(series, arc, tickers=set(series)))
             if arc_idx:
@@ -801,6 +1063,9 @@ def parse_feed(xml_bytes, source):
 
 
 def fetch_news(log):
+    if _FIX:
+        log.append("news omitted: fixtures mode is network-free")
+        return []
     items, seen, failed = [], set(), 0
     for source, url in FEEDS:
         try:
@@ -831,9 +1096,10 @@ def fetch_news(log):
 OV_VERSION = 1
 
 
-def build_overlay(news_path=None):
+def build_overlay(news_path=None, today=None):
     log = []
-    ov = {"v": OV_VERSION, "generated": datetime.date.today().isoformat(), "co": {}}
+    today = today or dhaka_now().date().isoformat()
+    ov = {"v": OV_VERSION, "generated": today, "co": {}}
     co = ov["co"]
 
     def slot(tk):
@@ -842,7 +1108,9 @@ def build_overlay(news_path=None):
     # ---- the exchange's company pages
     try:
         dse = get(DSE_JSON)
-        for tk, r in dse.items():
+        if dse is None:
+            log.append("exchange pages omitted: not in the fixtures")
+        for tk, r in (dse or {}).items():
             tk = (tk or "").strip().upper()
             if not tk: continue
             d = {}
@@ -877,7 +1145,7 @@ def build_overlay(news_path=None):
         log.append(f"exchange pages FAILED, omitted: {e}")
 
     # ---- daily sessions, indicators, index
-    series, idx = read_prices(log)
+    series, idx = read_prices(log, today=today)
     if series:
         cal = sorted({r["d"] for rows in series.values() for r in rows})
         cali = {x: i for i, x in enumerate(cal)}
@@ -890,39 +1158,7 @@ def build_overlay(news_path=None):
             rr = [r for r in rows if r.get("c") and r["d"] in cali]
             e = slot(tk)
             if len(rr) >= 3:
-                cc, vv, prev = [], [], 0
-                for r in rr:
-                    x = int(round(r["c"] * 100)); cc.append(x - prev); prev = x
-                    vv.append(int(round((r.get("v") or 0) / 1000.0)))
-                ks = [cali[r["d"]] for r in rr]
-                px = {"i0": ks[0], "c": cc}
-                if ks != list(range(ks[0], ks[0] + len(ks))): px["k"] = ks
-                if any(vv): px["v"] = vv
-                # The session's open, high and low, each minus its close, in
-                # paisa, aligned with c. A row whose source carries no open,
-                # high or low gets 0 in all three and its position in x; a
-                # row whose open, high or low contradicts its own close gets
-                # the same — a candle the source would not support is not
-                # drawn, and nothing is invented to fill it. A series with no
-                # known open, high or low at all carries none of the four
-                # keys.
-                oo, hh, ll, xmiss, any_k = [], [], [], [], False
-                for j, r in enumerate(rr):
-                    cp = int(round(r["c"] * 100))
-                    try:
-                        op = int(round(r["o"] * 100)) if r.get("o") else 0
-                        hp = int(round(r["h"] * 100)) if r.get("h") else 0
-                        lp = int(round(r["l"] * 100)) if r.get("l") else 0
-                        if not (op > 0 and hp > 0 and lp > 0): raise ValueError
-                        if not (lp <= min(op, cp) and max(op, cp) <= hp): raise ValueError
-                    except (TypeError, ValueError):
-                        xmiss.append(j); oo.append(0); hh.append(0); ll.append(0); continue
-                    any_k = True
-                    oo.append(op - cp); hh.append(hp - cp); ll.append(lp - cp)
-                if any_k:
-                    px["o"] = oo; px["h"] = hh; px["l"] = ll
-                    if xmiss: px["x"] = xmiss
-                e["px"] = px
+                e["px"] = encode_px(rr, cal, cali)
                 e["price"] = rr[-1]["c"]
                 e["qdate"] = rr[-1]["d"]
                 e["psrc"] = "dse"
@@ -1118,8 +1354,220 @@ def do_upload(base_url, side_path=None):
     return 0
 
 
+# ── dry-run: what the nightly run would publish, without publishing ──────
+# The mirror is read from the published bundle on disk; only the exchange's
+# answers (board, day-end, market-summary, markets) come from the network or,
+# with --fixtures, from tests/fixtures/dse_com_bd. A fresh mirror is left
+# exactly as it was; a stale one is filled with only the sessions it lacks.
+def load_mirror(path):
+    """The published bundle's data.js as a dict (cal, index, companies)."""
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    body = raw[len(PREFIX):] if raw.startswith(PREFIX) else raw
+    return json.loads(body.rstrip().rstrip(";"))
+
+
+def mirror_series(mirror):
+    """The mirror's price layer decoded to session rows: ({tk: [rows]}, index).
+    Each row is {d, o, h, l, c, v} in calendar order, straight from the shipped
+    px; a company the bundle gives no price layer to is absent."""
+    cal = mirror.get("cal") or []
+    series = {}
+    for tk, c in (mirror.get("companies") or {}).items():
+        rows = decode_px((c or {}).get("px"), cal)
+        if rows:
+            series[tk] = rows
+    return series, (mirror.get("index") or [])
+
+
+def board_session_date():
+    """The live board's session date (one fixture- or network-readable call),
+    or None when the board is unreadable."""
+    try:
+        doc = _http_json(DSE_BASE + "api/live/prices", timeout=60)
+    except Exception:
+        return None
+    return str(((doc.get("session") or {}).get("sessionDate") or "")).strip() or None
+
+
+def pin_clock(today):
+    """Pin the Dhaka clock to `today` 23:00 — well past the 15:00 close, so the
+    day counts as a closed session for last_trading_day. Returns the date."""
+    global _NOW
+    _NOW = datetime.datetime.combine(today, datetime.time(23, 0))
+    return today
+
+
+def apply_fallback(series, index, log, today, tickers=None):
+    """The packet's core. If the mirror's newest session is older than the last
+    DSE trading day (Sunday to Thursday, a day counted only after 15:00 Dhaka),
+    fetch the missing sessions from the new site with 3A03's parsers and fill
+    only those sessions. A fresh mirror is left exactly as it was. Mutates
+    `series` and `index`; returns (arc | None, index) where arc is
+    {code: {date: (d, o, h, l, c, v, prev_close)}}."""
+    tickers = tickers or list(series)
+    since = max((r["d"] for rows in series.values() for r in rows), default=None)
+    if not since:
+        log.append("fallback: the mirror has no sessions; nothing to check")
+        return None, index
+    arc, arc_newest, arc_idx = read_archive(log, since, tickers=tickers, today=today)
+    if arc is None:
+        return None, index
+    log.append(merge_archive(series, arc, tickers=set(tickers)))
+    if arc_idx:
+        have = {r[0]: i for i, r in enumerate(index)}
+        for (d, dsex, ds30) in arc_idx:
+            if d in have:
+                row = index[have[d]]
+                if dsex is not None:
+                    row[1] = round(dsex, 2)
+                if ds30 is not None:
+                    row[2] = ds30
+            else:
+                row = [d] + ([round(dsex, 2)] if dsex is not None else [None]) \
+                      + ([ds30] if ds30 is not None else [None])
+                index.append(row)
+                have[d] = len(index) - 1
+    return arc, index
+
+
+def filled_outside_limit(arc, limits):
+    """Every filled session whose close sits outside its day's band — the
+    exchange's own upper/lower limit when the markets page carried one, else a
+    move beyond +/-12% from the exchange's own previous close (past the
+    circuit-breaker, so a corporate action, not trading)."""
+    out = []
+    for code, dates in sorted((arc or {}).items()):
+        for d in sorted(dates):
+            (dd, _o, _h, _l, c, _v, ycp) = dates[d]
+            f = _outside_limit(code, ycp, c, limits)
+            if f:
+                f["date"] = dd
+                out.append(f)
+    return out
+
+
+def dry_run(out_dir, mirror_path, fixtures=True, today=None):
+    """Write the would-be price-layer overlay and a diff summary to out_dir,
+    without publishing and without touching data/ or web/. The mirror is read
+    from mirror_path on disk; the exchange's answers come from the fixtures
+    (--fixtures) or the network. Returns a process exit code."""
+    global _FIX
+    if fixtures:
+        _FIX = True
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out_dir = os.path.abspath(out_dir)
+    for bad in ("data", "web"):
+        b = os.path.join(root, bad)
+        if out_dir == b or out_dir.startswith(b + os.sep):
+            print("dry-run: refusing --out under %s/ (it ships to the site)" % bad)
+            return 2
+    if not os.path.exists(mirror_path):
+        print("dry-run: mirror %s not found" % mirror_path)
+        return 1
+    try:
+        mirror = load_mirror(mirror_path)
+    except Exception as e:
+        print("dry-run: cannot read mirror %s: %s" % (mirror_path, e))
+        return 1
+    series, index = mirror_series(mirror)
+    if not series:
+        print("dry-run: the mirror has no price layer; nothing to do")
+        return 1
+    mirror_cal = sorted(set(mirror.get("cal") or []))
+    if today is None:
+        bd = board_session_date()
+        today = datetime.date.fromisoformat(bd) if bd else dhaka_now().date()
+    pin_clock(today)
+    log = []
+    arc, index = apply_fallback(series, index, log, today, tickers=list(series))
+    series, copies, moved = clean_sessions(series, [r[0] for r in index])
+    if copies or moved:
+        log.append("dry-run: %d copy sessions removed, %d re-dated to their "
+                   "Thursday" % (len(copies), len(moved)))
+    cal = sorted({r["d"] for rows in series.values() for r in rows})
+    cali = {x: i for i, x in enumerate(cal)}
+    idx_c = [r[1] for r in (index or []) if r[1]]
+    idx_ret = {n: ret_over(idx_c, n) for n in (5, 21, 63, 126)}
+    ov = {"v": OV_VERSION, "generated": today.isoformat(), "cal": cal,
+          "index": index, "co": {}}
+    co = ov["co"]
+    for tk, rows in series.items():
+        rr = [r for r in rows if r.get("c") and r["d"] in cali]
+        if len(rr) < 3:
+            continue
+        e = co[tk] = {"px": encode_px(rr, cal, cali), "price": rr[-1]["c"],
+                      "qdate": rr[-1]["d"], "psrc": "dse"}
+        if len(rr) > 1 and rr[-2]["c"]:
+            e["chg"] = round(100.0 * (rr[-1]["c"] / rr[-2]["c"] - 1.0), 3)
+        t = technicals(rows, idx_ret)
+        if t:
+            e["tech"] = t
+    limits = _limits(log)
+    outside = filled_outside_limit(arc, limits)
+    new_dates = set(cal) - set(mirror_cal)
+    updated = [tk for tk in sorted(series)
+               if tk in co and any(r["d"] in new_dates for r in series[tk])]
+    up = set(updated)
+    missing = [tk for tk in sorted(series) if tk in co and tk not in up]
+    # D-09, stated for the report: after the fill, the newest session must be
+    # no more than STALE_DAYS calendar days before today, or the publish is
+    # refused (write_overlay's guard does this for the real run).
+    d09 = (today - datetime.date.fromisoformat(cal[-1])).days if cal else None
+    summary = {
+        "mirror_newest": mirror_cal[-1] if mirror_cal else None,
+        "would_be_newest": cal[-1] if cal else None,
+        "last_trading_day": last_trading_day(today).isoformat(),
+        "sessions_added": sorted(new_dates),
+        "tickers_updated": len(updated),
+        "tickers_updated_list": updated,
+        "tickers_missing": len(missing),
+        "tickers_missing_list": missing,
+        "outside_limit": outside,
+        "d09_age_days": d09,
+        "d09_pass": (d09 is not None and d09 <= STALE_DAYS),
+        "log": log,
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "overlay.json"), "w", encoding="utf-8") as f:
+        json.dump(ov, f, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    for l in log:
+        print("  " + l)
+    print("dry-run: mirror newest %s -> would-be %s; %d session(s) added, "
+          "%d/%d tickers updated, %d ticker(s) left as shipped, %d price(s) "
+          "outside the daily limit band; D-09 %s (newest is %s days old) -> %s"
+          % (summary["mirror_newest"], summary["would_be_newest"], len(new_dates),
+             len(updated), len(series), len(missing), len(outside),
+             "PASS" if summary["d09_pass"] else "FAIL", d09, out_dir))
+    return 0
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
+    if a and a[0] == "--dry-run":
+        opts, out_dir, today = a[1:], None, None
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        mirror = os.path.join(root, "web", "data.js")
+        fixtures = "--fixtures" in opts
+        i = 0
+        while i < len(opts):
+            o = opts[i]
+            if o == "--out":
+                out_dir = opts[i + 1]; i += 2; continue
+            if o.startswith("--out="):
+                out_dir = o.split("=", 1)[1]; i += 1; continue
+            if o == "--today":
+                today = datetime.date.fromisoformat(opts[i + 1]); i += 2; continue
+            if o.startswith("--today="):
+                today = datetime.date.fromisoformat(o.split("=", 1)[1]); i += 1; continue
+            if o == "--mirror":
+                mirror = opts[i + 1]; i += 2; continue
+            i += 1
+        if not out_dir:
+            print(__doc__); sys.exit(2)
+        sys.exit(dry_run(out_dir, mirror, fixtures=fixtures, today=today))
     if a and a[0] == "--overlay":
         if len(a) < 2:
             print(__doc__); sys.exit(2)
